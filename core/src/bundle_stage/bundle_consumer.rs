@@ -779,6 +779,10 @@ mod tests {
                 bundle_stage_leader_metrics::BundleStageLeaderMetrics, committer::Committer,
                 QosService, UnprocessedTransactionStorage,
             },
+            banking_stage::{
+                consumer::Consumer as BankingConsumer,
+                committer::Committer as BankingCommitter,
+            },
             packet_bundle::PacketBundle,
             proxy::block_engine_stage::BlockBuilderFeeInfo,
             tip_manager::{TipDistributionAccountConfig, TipManager, TipManagerConfig},
@@ -809,7 +813,7 @@ mod tests {
             bundle::{derive_bundle_id, SanitizedBundle},
             clock::MAX_PROCESSING_AGE,
             fee_calculator::{FeeRateGovernor, DEFAULT_TARGET_LAMPORTS_PER_SIGNATURE},
-            genesis_config::ClusterType,
+            genesis_config::{ClusterType, GenesisConfig},
             hash::Hash,
             native_token::sol_to_lamports,
             packet::Packet,
@@ -841,6 +845,15 @@ mod tests {
     struct TestFixture {
         genesis_config_info: GenesisConfigInfo,
         leader_keypair: Keypair,
+        bank: Arc<Bank>,
+        exit: Arc<AtomicBool>,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
+        poh_simulator: JoinHandle<()>,
+        entry_receiver: Receiver<WorkingBankEntry>,
+        bank_forks: Arc<RwLock<BankForks>>,
+    }
+
+    struct MiniFixture {
         bank: Arc<Bank>,
         exit: Arc<AtomicBool>,
         poh_recorder: Arc<RwLock<PohRecorder>>,
@@ -960,6 +973,32 @@ mod tests {
                 validator_pubkey,
             },
             leader_keypair,
+            bank,
+            bank_forks,
+            exit,
+            poh_recorder,
+            poh_simulator,
+            entry_receiver,
+        }
+    }
+
+    fn create_fixture_from_fixture(
+        genesis_config: GenesisConfig,
+    ) -> MiniFixture {
+        let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+
+        let bank = Arc::new(Bank::new_from_parent(bank, &Pubkey::default(), 1));
+
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(
+            Blockstore::open(ledger_path.path())
+                .expect("Expected to be able to open database ledger"),
+        );
+
+        let (exit, poh_recorder, poh_simulator, entry_receiver) =
+            create_test_recorder(&bank, blockstore, Some(PohConfig::default()), None);
+
+        MiniFixture {
             bank,
             bank_forks,
             exit,
@@ -1172,6 +1211,226 @@ mod tests {
         exit.store(true, Ordering::Relaxed);
         poh_simulator.join().unwrap();
         // TODO (LB): cleanup blockstore
+    }
+
+    /// Bank state should be the same if transactions are submitted through BundleStage or BankingStage
+    #[test]
+    fn test_bundle_consumer_against_bank_consumer() {
+        // test bundle execution without tip management
+        solana_logger::setup();
+        let TestFixture {
+            genesis_config_info,
+            leader_keypair,
+            bank,
+            exit,
+            poh_recorder,
+            poh_simulator,
+            entry_receiver,
+            bank_forks: _bank_forks,
+        } = create_test_fixture(1_000_000);
+        let recorder = poh_recorder.read().unwrap().new_recorder();
+        let leaderpubkey = leader_keypair.pubkey().clone();
+
+        let status = poh_recorder
+            .read()
+            .unwrap()
+            .reached_leader_slot(&leader_keypair.pubkey());
+        info!("status: {:?}", status);
+
+        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let committer = Committer::new(
+            None,
+            replay_vote_sender,
+            Arc::new(PrioritizationFeeCache::new(0u64)),
+        );
+
+        let block_builder_pubkey = Pubkey::new_unique();
+        let tip_manager = get_tip_manager(&genesis_config_info.voting_keypair.pubkey());
+        let block_builder_info = Arc::new(Mutex::new(BlockBuilderFeeInfo {
+            block_builder: block_builder_pubkey,
+            block_builder_commission: 10,
+        }));
+
+        let cluster_info = Arc::new(ClusterInfo::new(
+            ContactInfo::new(leader_keypair.pubkey(), 0, 0),
+            Arc::new(leader_keypair),
+            SocketAddrSpace::new(true),
+        ));
+
+        let mut consumer = BundleConsumer::new(
+            committer,
+            recorder,
+            QosService::new(1),
+            None,
+            tip_manager,
+            BundleAccountLocker::default(),
+            block_builder_info,
+            Duration::from_secs(10),
+            cluster_info,
+            BundleReservedSpaceManager::new(
+                MAX_BLOCK_UNITS,
+                3_000_000,
+                poh_recorder
+                    .read()
+                    .unwrap()
+                    .ticks_per_slot()
+                    .saturating_mul(8)
+                    .saturating_div(10),
+            ),
+        );
+
+        let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
+
+        let mut bundle_storage = UnprocessedTransactionStorage::new_bundle_storage();
+        let mut bundle_stage_leader_metrics = BundleStageLeaderMetrics::new(1);
+
+        let num_bundles: usize = 1;
+        let num_packets_per_bundle: usize = 3;
+        let mut packet_bundles = make_random_overlapping_bundles(
+            &genesis_config_info.mint_keypair,
+            num_bundles,
+            num_packets_per_bundle,
+            genesis_config_info.genesis_config.hash(),
+            10_000,
+        );
+        let deserialized_bundle = BundlePacketDeserializer::deserialize_bundle(
+            packet_bundles.get_mut(0).unwrap(),
+            false,
+            None,
+        )
+        .unwrap();
+        let mut error_metrics = TransactionErrorMetrics::default();
+        let sanitized_bundle = deserialized_bundle
+            .build_sanitized_bundle(
+                &bank_start.working_bank,
+                &HashSet::default(),
+                &mut error_metrics,
+            )
+            .unwrap();
+
+        let summary = bundle_storage.insert_bundles(vec![deserialized_bundle]);
+        assert_eq!(
+            summary.num_packets_inserted,
+            sanitized_bundle.transactions.len()
+        );
+        assert_eq!(summary.num_bundles_dropped, 0);
+        assert_eq!(summary.num_bundles_inserted, 1);
+
+        consumer.consume_buffered_bundles(
+            &bank_start,
+            &mut bundle_storage,
+            &mut bundle_stage_leader_metrics,
+        );
+
+        let mut transactions = Vec::new();
+        while let Ok(WorkingBankEntry {
+            bank: wbe_bank,
+            entries_ticks,
+        }) = entry_receiver.recv()
+        {
+            assert_eq!(bank.slot(), wbe_bank.slot());
+            for (entry, _) in entries_ticks {
+                if !entry.transactions.is_empty() {
+                    // transactions in this test are all overlapping, so each entry will contain 1 transaction
+                    assert_eq!(entry.transactions.len(), 1);
+                    transactions.extend(entry.transactions);
+                }
+            }
+            if transactions.len() == sanitized_bundle.transactions.len() {
+                break;
+            }
+        }
+
+        let bundle_versioned_transactions: Vec<_> = sanitized_bundle
+            .transactions
+            .iter()
+            .map(|tx| tx.to_versioned_transaction())
+            .collect();
+        assert_eq!(transactions, bundle_versioned_transactions);
+
+        let check_results = bank.check_transactions(
+            &sanitized_bundle.transactions,
+            &vec![Ok(()); sanitized_bundle.transactions.len()],
+            MAX_PROCESSING_AGE,
+            &mut error_metrics,
+        );
+
+        let expected_result: Vec<TransactionCheckResult> =
+            vec![Err(TransactionError::AlreadyProcessed); sanitized_bundle.transactions.len()];
+
+        assert_eq!(check_results, expected_result);
+
+        // store sanitized transactions
+        // works for now?
+        let bundle_sanitized_transactions: Vec<SanitizedTransaction> = sanitized_bundle.transactions;
+
+        poh_recorder
+            .write()
+            .unwrap()
+            .is_exited
+            .store(true, Ordering::Relaxed);
+        exit.store(true, Ordering::Relaxed);
+        poh_simulator.join().unwrap();
+        // freeze first bank from bank forks
+        bank.freeze();
+        // store bank hash
+        let bundle_bank_hash = bank.hash();
+        // create new root bank from genesis config
+        // (hacky but not sure can just fork parent bank and freeze, expect hash to match?)
+        // sorry...
+        let MiniFixture {
+            bank: bank2,
+            exit: exit2,
+            poh_recorder: poh_recorder2,
+            poh_simulator: poh_simulator2,
+            entry_receiver: _entry_receiver2,
+            bank_forks: _bank_forks2,
+        } = create_fixture_from_fixture(genesis_config_info.genesis_config);
+        // run sanitized bundle_sanitized_transactions through BankingStage
+        // transaction recorder
+        let recorder2 = poh_recorder2.read().unwrap().new_recorder();
+
+        let status2 = poh_recorder2
+            .read()
+            .unwrap()
+            .reached_leader_slot(&leaderpubkey);
+        info!("status: {:?}", status2);
+        // committer
+        let (replay_vote_sender2, _replay_vote_receiver2) = unbounded();
+        let committer2 = BankingCommitter::new(
+            None,
+            replay_vote_sender2,
+            Arc::new(PrioritizationFeeCache::new(0u64)),
+        );
+        // consumer
+        let consumer2 = BankingConsumer::new(
+            committer2,
+            recorder2,
+            QosService::new(1),
+            None,
+            HashSet::default(),
+            BundleAccountLocker::default(),
+        );
+        // process and record previous txns
+        for _ in 0..(num_bundles * num_packets_per_bundle) {
+            consumer2.process_and_record_transactions(&bank2, &bundle_sanitized_transactions, 0);
+        }
+        poh_recorder2
+            .write()
+            .unwrap()
+            .is_exited
+            .store(true, Ordering::Relaxed);
+        exit2.store(true, Ordering::Relaxed);
+        poh_simulator2.join().unwrap();
+        // freeze second banks
+        bank2.freeze();
+        // store bank hash
+        let banking_bank_hash = bank2.hash();
+        // check if hashes match
+        assert_eq!(bundle_bank_hash, banking_bank_hash);
+        // cleanup blockstore
+        // ahhh maybe later
+        // Blockstore::destroy(ledger_path2.path()).unwrap();
     }
 
     /// Happy-path bundle execution to ensure tip management works.
