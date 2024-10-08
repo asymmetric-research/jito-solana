@@ -820,9 +820,10 @@ mod tests {
             poh_config::PohConfig,
             pubkey::Pubkey,
             rent::Rent,
+            reserved_account_keys::ReservedAccountKeys,
             signature::{Keypair, Signer},
             system_transaction::transfer,
-            transaction::{SanitizedTransaction, TransactionError, VersionedTransaction},
+            transaction::{SanitizedTransaction, Transaction, TransactionError, VersionedTransaction, MessageHash},
             vote::state::VoteState,
         },
         solana_streamer::socket::SocketAddrSpace,
@@ -1041,6 +1042,115 @@ mod tests {
                     bundle_id,
                 }
             })
+            .collect()
+    }
+
+    fn make_overlapping_bundles(
+        mint_keypair: &Keypair,
+        num_bundles: usize,
+        num_packets_per_bundle: usize,
+        hash: Hash,
+        seed: u64,
+        max_transfer_amount: u64,
+    ) -> Vec<PacketBundle> {
+        let mut step: u64 = 0;
+
+        (0..num_bundles)
+            .map(|_| {
+                let transfers: Vec<_> = (0..num_packets_per_bundle)
+                    .map(|_| {
+                        let vtx = VersionedTransaction::from(transfer(
+                            mint_keypair,
+                            &mint_keypair.pubkey(),
+                            // do we need more randomness here?
+                            (seed + step) % max_transfer_amount,
+                            hash,
+                        ));
+                        step += 1;
+                        vtx
+                    })
+                    .collect();
+                let bundle_id = derive_bundle_id(&transfers);
+
+                PacketBundle {
+                    batch: PacketBatch::new(
+                        transfers
+                            .iter()
+                            .map(|tx| Packet::from_data(None, tx).unwrap())
+                            .collect(),
+                    ),
+                    bundle_id,
+                }
+            })
+            .collect()
+    }
+
+    #[allow(unused)]
+    fn make_sanitized_txns(
+        mint_keypair: &Keypair,
+        num_bundles: usize,
+        num_packets_per_bundle: usize,
+        hash: Hash,
+        seed: u64,
+        max_transfer_amount: u64,
+    ) -> Vec<SanitizedTransaction> {
+        let mut step: u64 = 0;
+
+        let num_txns: usize = num_bundles * num_packets_per_bundle;
+
+        let txns: Vec<_> = (0..num_txns)
+            .map(|_| {
+                let tx = Transaction::from(transfer(
+                      mint_keypair,
+                      &mint_keypair.pubkey(),
+                      (seed + step) % max_transfer_amount,
+                      hash,
+                ));
+                step += 1;
+                tx
+        })
+        .collect();
+
+        txns.into_iter()
+            .map(SanitizedTransaction::from_transaction_for_tests)
+            .collect()
+    }
+
+    fn make_sanitized_txns_from_versioned(
+        mint_keypair: &Keypair,
+        num_bundles: usize,
+        num_packets_per_bundle: usize,
+        hash: Hash,
+        bank: Arc<Bank>,
+        seed: u64,
+        max_transfer_amount: u64,
+    ) -> Vec<SanitizedTransaction> {
+        let mut step: u64 = 0;
+
+        let num_txns: usize = num_bundles * num_packets_per_bundle;
+
+        let txns: Vec<_> = (0..num_txns)
+             .map(|_| {
+                 let vtx = VersionedTransaction::from(transfer(
+                      mint_keypair,
+                      &mint_keypair.pubkey(),
+                      (seed + step) % max_transfer_amount,
+                      hash,
+                 ));
+                 step += 1;
+                 vtx
+        })
+        .collect();
+
+        txns.into_iter()
+            .map(|versioned| SanitizedTransaction::try_create(
+                    versioned.clone(),
+                    MessageHash::Compute,
+                    Some(false),
+                    bank.as_ref(),
+                    &ReservedAccountKeys::empty_key_set(),
+                )
+                .unwrap())
             .collect()
     }
 
@@ -1286,11 +1396,13 @@ mod tests {
 
         let num_bundles: usize = 1;
         let num_packets_per_bundle: usize = 3;
-        let mut packet_bundles = make_random_overlapping_bundles(
+        let seed = thread_rng().next_u64();
+        let mut packet_bundles = make_overlapping_bundles(
             &genesis_config_info.mint_keypair,
             num_bundles,
             num_packets_per_bundle,
             genesis_config_info.genesis_config.hash(),
+            seed,
             10_000,
         );
         let deserialized_bundle = BundlePacketDeserializer::deserialize_bundle(
@@ -1360,9 +1472,6 @@ mod tests {
 
         assert_eq!(check_results, expected_result);
 
-        // store sanitized transactions
-        // works for now?
-        let bundle_sanitized_transactions: Vec<SanitizedTransaction> = sanitized_bundle.transactions;
 
         poh_recorder
             .write()
@@ -1375,6 +1484,7 @@ mod tests {
         bank.freeze();
         // store bank hash
         let bundle_bank_hash = bank.hash();
+        let genesis_hash = genesis_config_info.genesis_config.hash();
         // create new root bank from genesis config
         // (hacky but not sure can just fork parent bank and freeze, expect hash to match?)
         // sorry...
@@ -1386,6 +1496,21 @@ mod tests {
             entry_receiver: _entry_receiver2,
             bank_forks: _bank_forks2,
         } = create_fixture_from_fixture(genesis_config_info.genesis_config);
+
+        // store sanitized transactions
+        // let bundle_sanitized_transactions: Vec<SanitizedTransaction> = sanitized_bundle.transactions;
+        // legacy transactions work for test setup
+        // versioned should work as well
+        let bundle_sanitized_transactions = make_sanitized_txns_from_versioned(
+            &genesis_config_info.mint_keypair,
+            num_bundles,
+            num_packets_per_bundle,
+            genesis_hash,
+            bank2.clone(),
+            seed,
+            10_000,
+        );
+
         // run sanitized bundle_sanitized_transactions through BankingStage
         // transaction recorder
         let recorder2 = poh_recorder2.read().unwrap().new_recorder();
