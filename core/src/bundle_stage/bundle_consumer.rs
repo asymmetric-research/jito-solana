@@ -789,6 +789,10 @@ mod tests {
         },
         crossbeam_channel::{unbounded, Receiver},
         jito_tip_distribution::sdk::derive_tip_distribution_account_address,
+        proptest::{
+            prelude::{prop_compose, proptest, any},
+            collection::vec,
+        },
         rand::{thread_rng, RngCore},
         solana_cost_model::{block_cost_limits::MAX_BLOCK_UNITS, cost_model::CostModel},
         solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
@@ -861,6 +865,13 @@ mod tests {
         poh_simulator: JoinHandle<()>,
         entry_receiver: Receiver<WorkingBankEntry>,
         bank_forks: Arc<RwLock<BankForks>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct BankOps {
+        should_bundle: Vec<bool>,
+        num_bundles: i32,
+        num_packets_per_bundle: i32,
     }
 
     pub(crate) fn simulate_poh(
@@ -1062,7 +1073,6 @@ mod tests {
                         let vtx = VersionedTransaction::from(transfer(
                             mint_keypair,
                             &mint_keypair.pubkey(),
-                            // do we need more randomness here?
                             (seed + step) % max_transfer_amount,
                             hash,
                         ));
@@ -1094,6 +1104,7 @@ mod tests {
         seed: u64,
         max_transfer_amount: u64,
     ) -> Vec<SanitizedTransaction> {
+
         let mut step: u64 = 0;
 
         let num_txns: usize = num_bundles * num_packets_per_bundle;
@@ -1125,6 +1136,7 @@ mod tests {
         seed: u64,
         max_transfer_amount: u64,
     ) -> Vec<SanitizedTransaction> {
+
         let mut step: u64 = 0;
 
         let num_txns: usize = num_bundles * num_packets_per_bundle;
@@ -1168,6 +1180,441 @@ mod tests {
                 commission_bps: 10,
             },
         })
+    }
+
+    prop_compose! {
+        fn arb_ops(max_operations: usize)(
+            length in 1..=max_operations)(
+                should_bundle in vec(any::<bool>(), length),
+                num_bundles in 1..=10,
+                num_packets_per_bundle in 1..=5,
+            ) -> BankOps {
+            BankOps { should_bundle, num_bundles, num_packets_per_bundle }
+        }
+    }
+
+    fn invert_ops(vec: &Vec<bool>) -> Vec<bool> {
+        vec.iter().map(|&value| !value).collect()
+    }
+
+    fn run_ops_a(num_bundles: usize, num_packets_per_bundle: usize, should_bundle: Vec<bool>, seed: u64) -> (Hash, GenesisConfigInfo, Keypair) {
+        let TestFixture {
+            genesis_config_info,
+            leader_keypair,
+            bank,
+            exit,
+            poh_recorder,
+            poh_simulator,
+            entry_receiver,
+            bank_forks: _bank_forks,
+        } = create_test_fixture(1_000_000);
+        let recorder = poh_recorder.read().unwrap().new_recorder();
+        let recorder2 = poh_recorder.read().unwrap().new_recorder();
+        let genesis_hash = genesis_config_info.genesis_config.hash();
+        let leaderkeys = leader_keypair.insecure_clone();
+
+        let status = poh_recorder
+            .read()
+            .unwrap()
+            .reached_leader_slot(&leader_keypair.pubkey());
+        info!("status: {:?}", status);
+
+        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let (replay_vote_sender2, _replay_vote_receiver2) = unbounded();
+        let committer = Committer::new(
+            None,
+            replay_vote_sender,
+            Arc::new(PrioritizationFeeCache::new(0u64)),
+        );
+
+        let block_builder_pubkey = Pubkey::new_unique();
+        let tip_manager = get_tip_manager(&genesis_config_info.voting_keypair.pubkey());
+        let block_builder_info = Arc::new(Mutex::new(BlockBuilderFeeInfo {
+            block_builder: block_builder_pubkey,
+            block_builder_commission: 10,
+        }));
+
+        let cluster_info = Arc::new(ClusterInfo::new(
+            ContactInfo::new(leader_keypair.pubkey(), 0, 0),
+            Arc::new(leader_keypair),
+            SocketAddrSpace::new(true),
+        ));
+
+        let mut consumer = BundleConsumer::new(
+            committer,
+            recorder,
+            QosService::new(1),
+            None,
+            tip_manager,
+            BundleAccountLocker::default(),
+            block_builder_info,
+            Duration::from_secs(10),
+            cluster_info,
+            BundleReservedSpaceManager::new(
+                MAX_BLOCK_UNITS,
+                3_000_000,
+                poh_recorder
+                    .read()
+                    .unwrap()
+                    .ticks_per_slot()
+                    .saturating_mul(8)
+                    .saturating_div(10),
+            ),
+        );
+
+        let committer2 = BankingCommitter::new(
+            None,
+            replay_vote_sender2,
+            Arc::new(PrioritizationFeeCache::new(0u64)),
+        );
+        // consumer
+        let consumer2 = BankingConsumer::new(
+            committer2,
+            recorder2,
+            QosService::new(1),
+            None,
+            HashSet::default(),
+            BundleAccountLocker::default(),
+        );
+
+
+        // start loop
+        for &should in should_bundle.iter() {
+            if should {
+                let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
+                let mut bundle_storage = UnprocessedTransactionStorage::new_bundle_storage();
+                let mut bundle_stage_leader_metrics = BundleStageLeaderMetrics::new(1);
+        
+                let seed = thread_rng().next_u64();
+                let mut packet_bundles = make_overlapping_bundles(
+                    &genesis_config_info.mint_keypair,
+                    num_bundles,
+                    num_packets_per_bundle,
+                    genesis_config_info.genesis_config.hash(),
+                    seed,
+                    10_000,
+                );
+                let deserialized_bundle = BundlePacketDeserializer::deserialize_bundle(
+                    packet_bundles.get_mut(0).unwrap(),
+                    false,
+                    None,
+                )
+                .unwrap();
+                let mut error_metrics = TransactionErrorMetrics::default();
+                let sanitized_bundle = deserialized_bundle
+                    .build_sanitized_bundle(
+                        &bank_start.working_bank,
+                        &HashSet::default(),
+                        &mut error_metrics,
+                    )
+                    .unwrap();
+        
+                let summary = bundle_storage.insert_bundles(vec![deserialized_bundle]);
+                assert_eq!(
+                    summary.num_packets_inserted,
+                    sanitized_bundle.transactions.len()
+                );
+                assert_eq!(summary.num_bundles_dropped, 0);
+                assert_eq!(summary.num_bundles_inserted, 1);
+        
+                consumer.consume_buffered_bundles(
+                    &bank_start,
+                    &mut bundle_storage,
+                    &mut bundle_stage_leader_metrics,
+                );
+        
+                let mut transactions = Vec::new();
+                while let Ok(WorkingBankEntry {
+                    bank: wbe_bank,
+                    entries_ticks,
+                }) = entry_receiver.recv()
+                {
+                    assert_eq!(bank.slot(), wbe_bank.slot());
+                    for (entry, _) in entries_ticks {
+                        if !entry.transactions.is_empty() {
+                            // transactions in this test are all overlapping, so each entry will contain 1 transaction
+                            assert_eq!(entry.transactions.len(), 1);
+                            transactions.extend(entry.transactions);
+                        }
+                    }
+                    if transactions.len() == sanitized_bundle.transactions.len() {
+                        break;
+                    }
+                }
+        
+                let bundle_versioned_transactions: Vec<_> = sanitized_bundle
+                    .transactions
+                    .iter()
+                    .map(|tx| tx.to_versioned_transaction())
+                    .collect();
+                assert_eq!(transactions, bundle_versioned_transactions);
+        
+                let check_results = bank.check_transactions(
+                    &sanitized_bundle.transactions,
+                    &vec![Ok(()); sanitized_bundle.transactions.len()],
+                    MAX_PROCESSING_AGE,
+                    &mut error_metrics,
+                );
+        
+                let expected_result: Vec<TransactionCheckResult> =
+                    vec![Err(TransactionError::AlreadyProcessed); sanitized_bundle.transactions.len()];
+        
+                assert_eq!(check_results, expected_result);
+            }
+            else {
+                let bundle_sanitized_transactions = make_sanitized_txns_from_versioned(
+                    &genesis_config_info.mint_keypair,
+                    num_bundles,
+                    num_packets_per_bundle,
+                    genesis_hash,
+                    bank.clone(),
+                    seed,
+                    10_000,
+                );
+                // process and record previous txns
+                for _ in 0..(num_bundles * num_packets_per_bundle) {
+                    consumer2.process_and_record_transactions(&bank, &bundle_sanitized_transactions, 0);
+                }
+            }
+        }
+        // end loop
+
+
+        poh_recorder
+            .write()
+            .unwrap()
+            .is_exited
+            .store(true, Ordering::Relaxed);
+        exit.store(true, Ordering::Relaxed);
+        poh_simulator.join().unwrap();
+        // freeze first bank from bank forks
+        bank.freeze();
+        // return bank hash, genesis config, leader pubkey
+        (bank.hash(), genesis_config_info, leaderkeys)
+    }
+
+    fn run_ops_b(
+        num_bundles: usize,
+        num_packets_per_bundle: usize,
+        should_bundle: Vec<bool>,
+        seed: u64,
+        genesis_config_info: GenesisConfigInfo,
+        leader_keypair: Keypair
+    ) -> Hash {
+        let MiniFixture {
+            bank,
+            exit,
+            poh_recorder,
+            poh_simulator,
+            entry_receiver,
+            bank_forks: _bank_forks,
+        } = create_fixture_from_fixture(genesis_config_info.genesis_config.clone());
+        let recorder = poh_recorder.read().unwrap().new_recorder();
+        let recorder2 = poh_recorder.read().unwrap().new_recorder();
+
+        let genesis_hash = genesis_config_info.genesis_config.hash();
+
+        let status = poh_recorder
+            .read()
+            .unwrap()
+            .reached_leader_slot(&leader_keypair.pubkey());
+        info!("status: {:?}", status);
+
+        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let (replay_vote_sender2, _replay_vote_receiver2) = unbounded();
+        let committer = Committer::new(
+            None,
+            replay_vote_sender,
+            Arc::new(PrioritizationFeeCache::new(0u64)),
+        );
+
+        let block_builder_pubkey = Pubkey::new_unique();
+        let tip_manager = get_tip_manager(&genesis_config_info.voting_keypair.pubkey());
+        let block_builder_info = Arc::new(Mutex::new(BlockBuilderFeeInfo {
+            block_builder: block_builder_pubkey,
+            block_builder_commission: 10,
+        }));
+
+        let cluster_info = Arc::new(ClusterInfo::new(
+            ContactInfo::new(leader_keypair.pubkey(), 0, 0),
+            Arc::new(leader_keypair),
+            SocketAddrSpace::new(true),
+        ));
+
+        let mut consumer = BundleConsumer::new(
+            committer,
+            recorder,
+            QosService::new(1),
+            None,
+            tip_manager,
+            BundleAccountLocker::default(),
+            block_builder_info,
+            Duration::from_secs(10),
+            cluster_info,
+            BundleReservedSpaceManager::new(
+                MAX_BLOCK_UNITS,
+                3_000_000,
+                poh_recorder
+                    .read()
+                    .unwrap()
+                    .ticks_per_slot()
+                    .saturating_mul(8)
+                    .saturating_div(10),
+            ),
+        );
+
+        let committer2 = BankingCommitter::new(
+            None,
+            replay_vote_sender2,
+            Arc::new(PrioritizationFeeCache::new(0u64)),
+        );
+        // consumer
+        let consumer2 = BankingConsumer::new(
+            committer2,
+            recorder2,
+            QosService::new(1),
+            None,
+            HashSet::default(),
+            BundleAccountLocker::default(),
+        );
+
+
+        // start loop
+        for &should in should_bundle.iter() {
+            if should {
+                let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
+                let mut bundle_storage = UnprocessedTransactionStorage::new_bundle_storage();
+                let mut bundle_stage_leader_metrics = BundleStageLeaderMetrics::new(1);
+        
+                let seed = thread_rng().next_u64();
+                let mut packet_bundles = make_overlapping_bundles(
+                    &genesis_config_info.mint_keypair,
+                    num_bundles,
+                    num_packets_per_bundle,
+                    genesis_config_info.genesis_config.hash(),
+                    seed,
+                    10_000,
+                );
+                let deserialized_bundle = BundlePacketDeserializer::deserialize_bundle(
+                    packet_bundles.get_mut(0).unwrap(),
+                    false,
+                    None,
+                )
+                .unwrap();
+                let mut error_metrics = TransactionErrorMetrics::default();
+                let sanitized_bundle = deserialized_bundle
+                    .build_sanitized_bundle(
+                        &bank_start.working_bank,
+                        &HashSet::default(),
+                        &mut error_metrics,
+                    )
+                    .unwrap();
+        
+                let summary = bundle_storage.insert_bundles(vec![deserialized_bundle]);
+                assert_eq!(
+                    summary.num_packets_inserted,
+                    sanitized_bundle.transactions.len()
+                );
+                assert_eq!(summary.num_bundles_dropped, 0);
+                assert_eq!(summary.num_bundles_inserted, 1);
+        
+                consumer.consume_buffered_bundles(
+                    &bank_start,
+                    &mut bundle_storage,
+                    &mut bundle_stage_leader_metrics,
+                );
+        
+                let mut transactions = Vec::new();
+                while let Ok(WorkingBankEntry {
+                    bank: wbe_bank,
+                    entries_ticks,
+                }) = entry_receiver.recv()
+                {
+                    assert_eq!(bank.slot(), wbe_bank.slot());
+                    for (entry, _) in entries_ticks {
+                        if !entry.transactions.is_empty() {
+                            // transactions in this test are all overlapping, so each entry will contain 1 transaction
+                            assert_eq!(entry.transactions.len(), 1);
+                            transactions.extend(entry.transactions);
+                        }
+                    }
+                    if transactions.len() == sanitized_bundle.transactions.len() {
+                        break;
+                    }
+                }
+        
+                let bundle_versioned_transactions: Vec<_> = sanitized_bundle
+                    .transactions
+                    .iter()
+                    .map(|tx| tx.to_versioned_transaction())
+                    .collect();
+                assert_eq!(transactions, bundle_versioned_transactions);
+        
+                let check_results = bank.check_transactions(
+                    &sanitized_bundle.transactions,
+                    &vec![Ok(()); sanitized_bundle.transactions.len()],
+                    MAX_PROCESSING_AGE,
+                    &mut error_metrics,
+                );
+        
+                let expected_result: Vec<TransactionCheckResult> =
+                    vec![Err(TransactionError::AlreadyProcessed); sanitized_bundle.transactions.len()];
+        
+                assert_eq!(check_results, expected_result);
+            }
+            else {
+                let bundle_sanitized_transactions = make_sanitized_txns_from_versioned(
+                    &genesis_config_info.mint_keypair,
+                    num_bundles,
+                    num_packets_per_bundle,
+                    genesis_hash,
+                    bank.clone(),
+                    seed,
+                    10_000,
+                );
+                // process and record previous txns
+                for _ in 0..(num_bundles * num_packets_per_bundle) {
+                    consumer2.process_and_record_transactions(&bank, &bundle_sanitized_transactions, 0);
+                }
+            }
+        }
+        // end loop
+
+
+        poh_recorder
+            .write()
+            .unwrap()
+            .is_exited
+            .store(true, Ordering::Relaxed);
+        exit.store(true, Ordering::Relaxed);
+        poh_simulator.join().unwrap();
+        // freeze first bank from bank forks
+        bank.freeze();
+        // return bank hash, genesis config, leader pubkey
+        bank.hash()
+    }
+
+    fn compare_bundle_consumer_against_bank_consumer(should_bundle: Vec<bool>, num_bundles: usize, num_packets_per_bundle: usize) {
+        let inverted_ops = invert_ops(&should_bundle);
+        let seed = thread_rng().next_u64();
+        // run ops on bank a
+        solana_logger::setup();
+        let (banka_hash, genesis_config_info, leader_keypair) = run_ops_a(num_bundles, num_packets_per_bundle, should_bundle, seed);
+        // run inverted ops on bank b
+        let bankb_hash = run_ops_b(num_bundles, num_packets_per_bundle, inverted_ops, seed, genesis_config_info, leader_keypair);
+        // compare hashes of bank a and bank b, should match
+        assert_eq!(banka_hash, bankb_hash);
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_bundle_consumer_against_bank_consumer(bank_ops in arb_ops(10)) {
+            compare_bundle_consumer_against_bank_consumer(
+                bank_ops.should_bundle,
+                bank_ops.num_bundles as usize,
+                bank_ops.num_packets_per_bundle as usize
+            );
+        }
     }
 
     /// Happy-path bundle execution w/ no tip management
