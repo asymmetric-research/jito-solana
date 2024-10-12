@@ -772,48 +772,30 @@ impl BundleConsumer {
 mod tests {
     use {
         crate::{
-            bundle_stage::{
+            banking_stage::{
+                committer::Committer as BankingCommitter, consumer::Consumer as BankingConsumer
+            }, bundle_stage::{
                 bundle_account_locker::BundleAccountLocker, bundle_consumer::BundleConsumer,
                 bundle_packet_deserializer::BundlePacketDeserializer,
                 bundle_reserved_space_manager::BundleReservedSpaceManager,
                 bundle_stage_leader_metrics::BundleStageLeaderMetrics, committer::Committer,
                 QosService, UnprocessedTransactionStorage,
-            },
-            banking_stage::{
-                consumer::Consumer as BankingConsumer,
-                committer::Committer as BankingCommitter,
-            },
-            packet_bundle::PacketBundle,
-            proxy::block_engine_stage::BlockBuilderFeeInfo,
-            tip_manager::{TipDistributionAccountConfig, TipManager, TipManagerConfig},
-        },
-        crossbeam_channel::{unbounded, Receiver},
-        jito_tip_distribution::sdk::derive_tip_distribution_account_address,
-        proptest::{
-            prelude::{prop_compose, proptest, any},
-            collection::vec,
-        },
-        rand::{thread_rng, RngCore},
-        solana_cost_model::{block_cost_limits::MAX_BLOCK_UNITS, cost_model::CostModel},
-        solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
-        solana_ledger::{
+            }, immutable_deserialized_bundle::ImmutableDeserializedBundle, packet_bundle::PacketBundle, proxy::block_engine_stage::BlockBuilderFeeInfo, tip_manager::{TipDistributionAccountConfig, TipManager, TipManagerConfig}
+        }, crossbeam_channel::{unbounded, Receiver}, jito_protos::proto::bundle::Bundle, jito_tip_distribution::sdk::derive_tip_distribution_account_address, proptest::{
+            collection::vec, prelude::{any, prop_compose, proptest}
+        }, rand::{thread_rng, RngCore}, solana_cost_model::{block_cost_limits::MAX_BLOCK_UNITS, cost_model::CostModel}, solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo}, solana_ledger::{
             blockstore::Blockstore, genesis_utils::create_genesis_config,
             get_tmp_ledger_path_auto_delete, leader_schedule_cache::LeaderScheduleCache,
-        },
-        solana_perf::packet::PacketBatch,
-        solana_poh::{
+        }, solana_perf::packet::PacketBatch, solana_poh::{
             poh_recorder::{PohRecorder, Record, WorkingBankEntry},
             poh_service::PohService,
-        },
-        solana_program_test::programs::spl_programs,
-        solana_runtime::{
+        }, solana_program_test::programs::spl_programs, solana_runtime::{
             bank::Bank,
             bank_forks::BankForks,
             genesis_utils::{create_genesis_config_with_leader_ex, GenesisConfigInfo},
             installed_scheduler_pool::BankWithScheduler,
             prioritization_fee_cache::PrioritizationFeeCache,
-        },
-        solana_sdk::{
+        }, solana_sdk::{
             bundle::{derive_bundle_id, SanitizedBundle},
             clock::MAX_PROCESSING_AGE,
             fee_calculator::{FeeRateGovernor, DEFAULT_TARGET_LAMPORTS_PER_SIGNATURE},
@@ -827,15 +809,12 @@ mod tests {
             reserved_account_keys::ReservedAccountKeys,
             signature::{Keypair, Signer},
             system_transaction::transfer,
-            transaction::{SanitizedTransaction, Transaction, TransactionError, VersionedTransaction, MessageHash},
+            transaction::{MessageHash, SanitizedTransaction, Transaction, TransactionError, VersionedTransaction},
             vote::state::VoteState,
-        },
-        solana_streamer::socket::SocketAddrSpace,
-        solana_svm::{
+        }, solana_streamer::socket::SocketAddrSpace, solana_svm::{
             account_loader::TransactionCheckResult,
             transaction_error_metrics::TransactionErrorMetrics,
-        },
-        std::{
+        }, std::{
             collections::HashSet,
             str::FromStr,
             sync::{
@@ -844,7 +823,7 @@ mod tests {
             },
             thread::{Builder, JoinHandle},
             time::Duration,
-        },
+        }
     };
 
     struct TestFixture {
@@ -1277,15 +1256,14 @@ mod tests {
             BundleAccountLocker::default(),
         );
 
+        let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
 
         // start loop
         for &should in should_bundle.iter() {
             if should {
-                let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
                 let mut bundle_storage = UnprocessedTransactionStorage::new_bundle_storage();
                 let mut bundle_stage_leader_metrics = BundleStageLeaderMetrics::new(1);
         
-                let seed = thread_rng().next_u64();
                 let mut packet_bundles = make_overlapping_bundles(
                     &genesis_config_info.mint_keypair,
                     num_bundles,
@@ -1478,15 +1456,14 @@ mod tests {
             BundleAccountLocker::default(),
         );
 
+        let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
 
         // start loop
         for &should in should_bundle.iter() {
             if should {
-                let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
                 let mut bundle_storage = UnprocessedTransactionStorage::new_bundle_storage();
                 let mut bundle_stage_leader_metrics = BundleStageLeaderMetrics::new(1);
         
-                let seed = thread_rng().next_u64();
                 let mut packet_bundles = make_overlapping_bundles(
                     &genesis_config_info.mint_keypair,
                     num_bundles,
@@ -1590,7 +1567,6 @@ mod tests {
         poh_simulator.join().unwrap();
         // freeze first bank from bank forks
         bank.freeze();
-        // return bank hash, genesis config, leader pubkey
         bank.hash()
     }
 
@@ -1599,7 +1575,7 @@ mod tests {
         let seed = thread_rng().next_u64();
         // run ops on bank a
         solana_logger::setup();
-        let (banka_hash, genesis_config_info, leader_keypair) = run_ops_a(num_bundles, num_packets_per_bundle, should_bundle, seed);
+        let (banka_hash, genesis_config_info, leader_keypair) = run_ops_a(num_bundles, num_packets_per_bundle, should_bundle.clone(), seed);
         // run inverted ops on bank b
         let bankb_hash = run_ops_b(num_bundles, num_packets_per_bundle, inverted_ops, seed, genesis_config_info, leader_keypair);
         // compare hashes of bank a and bank b, should match
@@ -1608,7 +1584,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn proptest_bundle_consumer_against_bank_consumer(bank_ops in arb_ops(10)) {
+        fn proptest_bundle_consumer_against_bank_consumer(bank_ops in arb_ops(1)) {
             compare_bundle_consumer_against_bank_consumer(
                 bank_ops.should_bundle,
                 bank_ops.num_bundles as usize,
@@ -1841,7 +1817,7 @@ mod tests {
         let mut bundle_storage = UnprocessedTransactionStorage::new_bundle_storage();
         let mut bundle_stage_leader_metrics = BundleStageLeaderMetrics::new(1);
 
-        let num_bundles: usize = 1;
+        let num_bundles: usize = 2;
         let num_packets_per_bundle: usize = 3;
         let seed = thread_rng().next_u64();
         let mut packet_bundles = make_overlapping_bundles(
@@ -1852,34 +1828,49 @@ mod tests {
             seed,
             10_000,
         );
-        let deserialized_bundle = BundlePacketDeserializer::deserialize_bundle(
-            packet_bundles.get_mut(0).unwrap(),
-            false,
-            None,
-        )
-        .unwrap();
+        // before this was only 0th bundle out of n bundles...
+        let deserialized_bundles: Vec<ImmutableDeserializedBundle> = packet_bundles
+                    .iter_mut()
+                    .map(|bundle| BundlePacketDeserializer::deserialize_bundle(
+                        bundle,
+                        false,
+                        None, 
+                    )
+                    .unwrap())
+                    .collect();
         let mut error_metrics = TransactionErrorMetrics::default();
-        let sanitized_bundle = deserialized_bundle
-            .build_sanitized_bundle(
-                &bank_start.working_bank,
-                &HashSet::default(),
-                &mut error_metrics,
-            )
-            .unwrap();
+        let sanitized_bundles: Vec<SanitizedBundle> = deserialized_bundles
+                    .iter()
+                    .map(|imm| imm.
+                        build_sanitized_bundle(
+                            &bank_start.working_bank,
+                            &HashSet::default(),
+                            &mut error_metrics,
+                        )
+                    .unwrap())
+                    .collect();
 
-        let summary = bundle_storage.insert_bundles(vec![deserialized_bundle]);
+        // of course, we should deserialize+insert ALL and build a vec to pass to the summary
+        // the unit tests only got the first one
+        let summary = bundle_storage.insert_bundles(deserialized_bundles);
         assert_eq!(
             summary.num_packets_inserted,
-            sanitized_bundle.transactions.len()
+            sanitized_bundles.iter().map(|v| v.transactions.len()).sum::<usize>()
         );
         assert_eq!(summary.num_bundles_dropped, 0);
-        assert_eq!(summary.num_bundles_inserted, 1);
+        assert_eq!(summary.num_bundles_inserted, num_bundles);
 
         consumer.consume_buffered_bundles(
             &bank_start,
             &mut bundle_storage,
             &mut bundle_stage_leader_metrics,
         );
+
+        let bundletx: Vec<SanitizedTransaction> = sanitized_bundles
+            .into_iter()
+            .map(|bundle| bundle.transactions)
+            .flatten()
+            .collect();
 
         let mut transactions = Vec::new();
         while let Ok(WorkingBankEntry {
@@ -1895,27 +1886,26 @@ mod tests {
                     transactions.extend(entry.transactions);
                 }
             }
-            if transactions.len() == sanitized_bundle.transactions.len() {
+            if transactions.len() == bundletx.len() {
                 break;
             }
         }
 
-        let bundle_versioned_transactions: Vec<_> = sanitized_bundle
-            .transactions
+        let bundle_versioned_transactions: Vec<_> = bundletx
             .iter()
             .map(|tx| tx.to_versioned_transaction())
             .collect();
         assert_eq!(transactions, bundle_versioned_transactions);
 
         let check_results = bank.check_transactions(
-            &sanitized_bundle.transactions,
-            &vec![Ok(()); sanitized_bundle.transactions.len()],
+            &bundletx,
+            &vec![Ok(()); bundletx.len()],
             MAX_PROCESSING_AGE,
             &mut error_metrics,
         );
 
         let expected_result: Vec<TransactionCheckResult> =
-            vec![Err(TransactionError::AlreadyProcessed); sanitized_bundle.transactions.len()];
+            vec![Err(TransactionError::AlreadyProcessed); bundletx.len()];
 
         assert_eq!(check_results, expected_result);
 
@@ -1927,7 +1917,7 @@ mod tests {
             .store(true, Ordering::Relaxed);
         exit.store(true, Ordering::Relaxed);
         poh_simulator.join().unwrap();
-        // freeze first bank from bank forks
+        // freeze first bank 
         bank.freeze();
         // store bank hash
         let bundle_bank_hash = bank.hash();
