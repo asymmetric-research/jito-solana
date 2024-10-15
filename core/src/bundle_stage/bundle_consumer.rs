@@ -1214,7 +1214,7 @@ mod tests {
             exit,
             poh_recorder,
             poh_simulator,
-            entry_receiver,
+            entry_receiver: _entry_receiver,
             bank_forks: _bank_forks,
         } = create_test_fixture(1_000_000);
         let recorder = poh_recorder.read().unwrap().new_recorder();
@@ -1288,7 +1288,6 @@ mod tests {
 
         let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
 
-        // start loop
         for &should in should_bundle.iter() {
             seed += (num_bundles * num_packets_per_bundle) as u64;
             if should {
@@ -1344,25 +1343,6 @@ mod tests {
                     .flatten()
                     .collect();
 
-                let mut transactions = Vec::new();
-                while let Ok(WorkingBankEntry {
-                    bank: wbe_bank,
-                    entries_ticks,
-                }) = entry_receiver.recv()
-                {
-                    assert_eq!(bank.slot(), wbe_bank.slot());
-                    for (entry, _) in entries_ticks {
-                        if !entry.transactions.is_empty() {
-                            // transactions in this test are all overlapping, so each entry will contain 1 transaction
-                            assert_eq!(entry.transactions.len(), 1);
-                            transactions.extend(entry.transactions);
-                        }
-                    }
-                    if transactions.len() == bundletx.len() {
-                        break;
-                    }
-                }
-
                 let check_results = bank.check_transactions(
                     &bundletx,
                     &vec![Ok(()); bundletx.len()],
@@ -1391,8 +1371,6 @@ mod tests {
                 }
             }
         }
-        // end loop
-
 
         poh_recorder
             .write()
@@ -1420,7 +1398,7 @@ mod tests {
             exit,
             poh_recorder,
             poh_simulator,
-            entry_receiver,
+            entry_receiver: _entry_receiver,
             bank_forks: _bank_forks,
         } = create_fixture_from_fixture(genesis_config_info.genesis_config.clone());
         let recorder = poh_recorder.read().unwrap().new_recorder();
@@ -1494,7 +1472,6 @@ mod tests {
 
         let bank_start = poh_recorder.read().unwrap().bank_start().unwrap();
 
-        // start loop
         for &should in should_bundle.iter() {
             seed += (num_bundles * num_packets_per_bundle) as u64;
             if should {
@@ -1550,25 +1527,6 @@ mod tests {
                     .flatten()
                     .collect();
 
-                let mut transactions = Vec::new();
-                while let Ok(WorkingBankEntry {
-                    bank: wbe_bank,
-                    entries_ticks,
-                }) = entry_receiver.recv()
-                {
-                    assert_eq!(bank.slot(), wbe_bank.slot());
-                    for (entry, _) in entries_ticks {
-                        if !entry.transactions.is_empty() {
-                            // transactions in this test are all overlapping, so each entry will contain 1 transaction
-                            assert_eq!(entry.transactions.len(), 1);
-                            transactions.extend(entry.transactions);
-                        }
-                    }
-                    if transactions.len() == bundletx.len() {
-                        break;
-                    }
-                }
-
                 let check_results = bank.check_transactions(
                     &bundletx,
                     &vec![Ok(()); bundletx.len()],
@@ -1597,8 +1555,6 @@ mod tests {
                 }
             }
         }
-        // end loop
-
 
         poh_recorder
             .write()
@@ -1870,7 +1826,6 @@ mod tests {
             seed,
             10_000,
         );
-        // before this was only 0th bundle out of n bundles...
         let deserialized_bundles: Vec<ImmutableDeserializedBundle> = packet_bundles
                     .iter_mut()
                     .map(|bundle| BundlePacketDeserializer::deserialize_bundle(
@@ -1892,8 +1847,6 @@ mod tests {
                     .unwrap())
                     .collect();
 
-        // of course, we should deserialize+insert ALL and build a vec to pass to the summary
-        // the unit tests only got the first one
         let summary = bundle_storage.insert_bundles(deserialized_bundles);
         assert_eq!(
             summary.num_packets_inserted,
@@ -1965,8 +1918,6 @@ mod tests {
         let bundle_bank_hash = bank.hash();
         let genesis_hash = genesis_config_info.genesis_config.hash();
         // create new root bank from genesis config
-        // (hacky but not sure can just fork parent bank and freeze, expect hash to match?)
-        // sorry...
         let MiniFixture {
             bank: bank2,
             exit: exit2,
